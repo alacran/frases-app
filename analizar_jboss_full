@@ -1,0 +1,202 @@
+# Script de Análisis y Optimización para Servidor JBoss
+
+A continuación te presento un script Bash que recopila información de hardware y software de un servidor JBoss, analiza posibles cuellos de botella y sugiere optimizaciones:
+
+```bash
+#!/bin/bash
+
+# Script de análisis y optimización para servidores JBoss
+# Autor: [Tu Nombre]
+# Fecha: $(date)
+# Versión: 1.0
+
+# Configuración
+LOG_FILE="jboss_optimization_$(date +%Y%m%d_%H%M%S).log"
+JBOSS_HOME=${JBOSS_HOME:-"/opt/jboss"}  # Ajustar según tu instalación
+JBOSS_USER=${JBOSS_USER:-"jboss"}       # Usuario que ejecuta JBoss
+
+# Función para registrar mensajes
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+# Encabezado del informe
+echo "=============================================" | tee $LOG_FILE
+echo " Informe de Análisis y Optimización JBoss" | tee -a $LOG_FILE
+echo " Fecha: $(date)" | tee -a $LOG_FILE
+echo "=============================================" | tee -a $LOG_FILE
+
+# 1. Recolección de información del sistema
+log "1. Recolectando información del sistema..."
+
+# Información del hardware
+log "1.1. Información del hardware:"
+echo "---- Procesador ----" | tee -a $LOG_FILE
+lscpu | grep -E 'Model name|Socket|Core|CPU\(s\)' | tee -a $LOG_FILE
+echo "" | tee -a $LOG_FILE
+
+echo "---- Memoria ----" | tee -a $LOG_FILE
+free -h | tee -a $LOG_FILE
+echo "" | tee -a $LOG_FILE
+
+echo "---- Disco ----" | tee -a $LOG_FILE
+df -h | tee -a $LOG_FILE
+lsblk | tee -a $LOG_FILE
+echo "" | tee -a $LOG_FILE
+
+# Información del sistema operativo
+log "1.2. Información del sistema operativo:"
+cat /etc/os-release | tee -a $LOG_FILE
+uname -a | tee -a $LOG_FILE
+echo "" | tee -a $LOG_FILE
+
+# 2. Recolección de información de JBoss
+log "2. Recolectando información de JBoss..."
+
+# Verificar si JBoss está en ejecución
+JBOSS_PID=$(pgrep -u $JBOSS_USER -f "jboss")
+if [ -z "$JBOSS_PID" ]; then
+    log "JBoss no parece estar en ejecución."
+else
+    log "JBoss está en ejecución con PID: $JBOSS_PID"
+    
+    # Versión de JBoss
+    log "2.1. Versión de JBoss:"
+    $JBOSS_HOME/bin/standalone.sh --version | tee -a $LOG_FILE
+    echo "" | tee -a $LOG_FILE
+    
+    # Configuración de memoria JVM
+    log "2.2. Configuración JVM:"
+    ps -p $JBOSS_PID -o command | grep -oP '(Xms|Xmx|XX:MaxMetaspaceSize)=\S+' | tee -a $LOG_FILE
+    echo "" | tee -a $LOG_FILE
+    
+    # Módulos cargados
+    log "2.3. Módulos cargados (top 20 por tamaño):"
+    jcmd $JBOSS_PID VM.native_memory summary | grep -A 20 "Total: reserved" | tee -a $LOG_FILE
+    echo "" | tee -a $LOG_FILE
+    
+    # Estadísticas de threads
+    log "2.4. Estadísticas de threads:"
+    jstack $JBOSS_PID | grep -c "java.lang.Thread.State" | tee -a $LOG_FILE
+    jstack $JBOSS_PID | grep "java.lang.Thread.State" | sort | uniq -c | tee -a $LOG_FILE
+    echo "" | tee -a $LOG_FILE
+    
+    # Conexiones abiertas
+    log "2.5. Conexiones de red:"
+    netstat -tulnp | grep $JBOSS_PID | tee -a $LOG_FILE
+    echo "" | tee -a $LOG_FILE
+    
+    # Uso de datasources (requiere acceso a la consola de administración)
+    log "2.6. Datasources (información básica):"
+    find $JBOSS_HOME/standalone/configuration -name "*.xml" -exec grep -l "datasource" {} \; | tee -a $LOG_FILE
+    echo "" | tee -a $LOG_FILE
+fi
+
+# 3. Análisis y recomendaciones
+log "3. Análisis y recomendaciones preliminares:"
+
+# Análisis de memoria
+TOTAL_MEM=$(free -m | awk '/Mem:/ {print $2}')
+JVM_XMX=$(ps -p ${JBOSS_PID:-0} -o command 2>/dev/null | grep -oP 'Xmx\d+[MmGg]' || echo "Xmx0")
+JVM_XMX_VALUE=${JVM_XMX:3}
+JVM_XMX_UNIT=${JVM_XMX: -1}
+JVM_XMX_MB=0
+
+if [[ $JVM_XMX_VALUE =~ ^[0-9]+$ ]]; then
+    case $JVM_XMX_UNIT in
+        [Gg]) JVM_XMX_MB=$((JVM_XMX_VALUE * 1024)) ;;
+        [Mm]) JVM_XMX_MB=$JVM_XMX_VALUE ;;
+        *) JVM_XMX_MB=$((JVM_XMX_VALUE / 1024 / 1024)) ;;
+    esac
+fi
+
+if [ $JVM_XMX_MB -gt 0 ]; then
+    MEM_RATIO=$(( (JVM_XMX_MB * 100) / TOTAL_MEM ))
+    
+    if [ $MEM_RATIO -gt 70 ]; then
+        log "ADVERTENCIA: La JVM está configurada para usar más del 70% de la memoria física ($JVM_XMX_MB MB de $TOTAL_MEM MB)."
+        log "RECOMENDACIÓN: Considere reducir Xmx o aumentar la memoria física del servidor."
+    elif [ $MEM_RATIO -lt 30 ]; then
+        log "NOTA: La JVM está configurada para usar menos del 30% de la memoria física ($JVM_XMX_MB MB de $TOTAL_MEM MB)."
+        log "RECOMENDACIÓN: Podría aumentar Xmx para mejorar el rendimiento, dejando al menos 1-2 GB para el SO."
+    else
+        log "La configuración de memoria JVM parece adecuada ($JVM_XMX_MB MB de $TOTAL_MEM MB)."
+    fi
+fi
+
+# Análisis de CPU
+CPU_CORES=$(nproc)
+if [ $CPU_CORES -lt 2 ]; then
+    log "ADVERTENCIA: El servidor tiene solo $CPU_CORES núcleos de CPU."
+    log "RECOMENDACIÓN: Para entornos de producción, considere al menos 4 núcleos."
+else
+    log "El servidor tiene $CPU_CORES núcleos de CPU, lo cual es adecuado para un servidor JBoss."
+fi
+
+# Análisis de disco
+DISK_SPACE=$(df -h / | awk 'NR==2 {print $4}')
+log "Espacio disponible en disco raíz: $DISK_SPACE"
+log "RECOMENDACIÓN: Asegúrese de tener al menos 10% de espacio libre para operaciones normales."
+
+# Configuraciones específicas de JBoss
+if [ -n "$JBOSS_PID" ]; then
+    # Verificar GC
+    GC_TYPE=$(ps -p $JBOSS_PID -o command | grep -oP 'Use[A-Za-z0-9]+GC')
+    if [ -z "$GC_TYPE" ]; then
+        log "ADVERTENCIA: No se detectó configuración explícita de Garbage Collector."
+        log "RECOMENDACIÓN: Para aplicaciones con alta carga, configure un GC adecuado (como G1GC)."
+    else
+        log "Garbage Collector configurado: $GC_TYPE"
+    fi
+    
+    # Verificar configuración de threads
+    THREADS=$(jstack $JBOSS_PID | grep -c "java.lang.Thread.State")
+    log "Número total de threads en JVM: $THREADS"
+    if [ $THREADS -gt 500 ]; then
+        log "ADVERTENCIA: Alto número de threads ($THREADS), podría indicar problemas de diseño."
+        log "RECOMENDACIÓN: Revise la configuración de pools de threads y la gestión de conexiones."
+    fi
+fi
+
+# 4. Recomendaciones generales
+log "4. Recomendaciones generales para optimización:"
+log "- Revise los logs de JBoss ($JBOSS_HOME/standalone/log/) para errores o warnings."
+log "- Monitoree el uso de heap con herramientas como VisualVM o JConsole."
+log "- Considere implementar un sistema de monitoreo continuo (Prometheus + Grafana)."
+log "- Para producción, asegúrese de tener configurado un GC adecuado y parámetros JVM optimizados."
+log "- Revise la configuración de pools de threads y conexiones según la carga esperada."
+log "- Considere implementar clustering si requiere alta disponibilidad o escalabilidad horizontal."
+
+# Finalización
+log "Análisis completado. Los resultados se han guardado en $LOG_FILE"
+echo "=============================================" | tee -a $LOG_FILE
+```
+
+## Instrucciones de uso:
+
+1. Guarda el script como `analizar_jboss.sh`
+2. Dale permisos de ejecución: `chmod +x analizar_jboss.sh`
+3. Ejecútalo como root o con un usuario con privilegios: `./analizar_jboss.sh`
+4. Revisa el archivo de log generado (`jboss_optimization_*.log`)
+
+## Requisitos previos:
+
+- El servidor JBoss debe estar instalado (el script detecta automáticamente la ubicación o puedes configurar JBOSS_HOME)
+- Java JDK instalado (para comandos como jstack, jcmd)
+- Herramientas básicas como lscpu, free, df, netstat disponibles
+
+## Características del script:
+
+1. **Análisis de hardware**: CPU, memoria, disco
+2. **Análisis de JBoss**: 
+   - Configuración JVM (Xms, Xmx, GC)
+   - Threads en uso
+   - Conexiones de red
+   - Datasources
+3. **Recomendaciones de optimización**:
+   - Ajuste de memoria JVM
+   - Configuración de Garbage Collector
+   - Gestión de threads
+   - Recomendaciones generales para producción
+
+El script genera un informe detallado con hallazgos y sugerencias para mejorar el rendimiento de tu servidor JBoss.
